@@ -201,3 +201,195 @@ class PostBase(BaseModel):
 ```
 
 ## Adding Custom data validation with Pydantic
+
+Probably in a real world project, you might need to add your own custom validation logic for your specific case. Pydantic allows this by defining validator, which are methods on the model that can be applied at a field lever or an object level. 
+
+### Applying validation at a field level
+
+This is the most common case: have a validation rule for a single field. To define it in pydantic, we'll just have to write a static method on our model and decorate it with the validator. As a reminder, decorators are syntatic sugar, allowing the wrapping of a function or a class with common logic, without compromising redability. 
+
+```python
+from datetime import date
+
+from pydantic import BaseModel, validator
+
+class Person(BaseModel):
+    first_name: str
+    last_name: str
+    birthdate: date
+
+    @validator
+    def valid_birthdate(cls, v:date):
+        delta = date.today() - v
+        age = delta.days / 365
+        if age > 120:
+            raise ValueError("You seem a bit too old!")
+        return v
+```
+
+As you see the validator is a static class method, with the value to validate v as the argument. It's decorated by the validator decorator, which expects the name of the arguments to validate as the first argument.
+Pydantic expects two things for this method, detailed as follows:
+- If the value is not valid according to your logic, you should raise a *ValueError* error with an explicit error message.
+- Otherwise, you should return the value that will be assigned in the model. Notice that it doesn't need to be tha same as the input value: you can very well change it to fit your needs. That's actually what we'll do in an upcoming section. *Applying validation before Pydantic parsing.*
+
+### Applying validation at an object level
+
+It happens quite often that the validation of one field is dependent on another -for example, to check if a password confirmation matches the password or to enforce a filed to be required in a certain circumstances. To allow this kind of validation, we need to to access to whole object data. For this, pydantic provides the *root_validator* decorator:
+
+```python
+from pydantic import BaseModel, EmailStr, ValidationError, root_validator
+
+class UserRegistration(BaseModel):
+    email: EmailStr
+    password: str
+    password_confirmation: str
+
+    @root_validator()
+    def passwords_match(cls, values):
+        password = values.get("password")
+        password_confirmation = values.get("password_confirmation")
+        if password != password_confirmation:
+            raise ValueError("Passwords don't match")
+        return values
+```
+
+### Applying validation before Pydantic parsing
+
+By default your validators are run after parsing pydantic has done its parsing work. This means that the value you get already conforms to the type of the field you specified. If the type is incorrect, pydantic raises an error without calling your validator. 
+
+However, you may sometimes wish to provide some custom parsing logic that allows you to transform input values that would have been incorrect for the type you set. In that case, you would need to run your validator before the pydantic parser: this is the purpose of the **pre** argument on **validator**.
+
+```python
+from typing import List
+
+from pydantic import BaseModel, validator
+
+class Model(BaseModel):
+    values: List[int]
+
+    @validator("values", pre=True)
+    def split_string_values(cls, v):
+        if isintance(v,str):
+            return v.split(",")
+        return v
+
+m = Model(value='1,2,3')
+```
+
+## Working with Pydantic objects
+
+When developing API endpoints with FastAPI, you'll likely get a lot of Pydantic models instances to handle. It's then up to you to implement the logic to make a link between those objects and your services, such as your database or your machine learning (ML) model. Fortunately, Pydantic provides methods to make this very easy. We'll review common use cases that will be useful for you during development. 
+
+### Converting an object into a dictionary
+
+This is probably the action you'll perform most on a pydantic object: covert it to a raw dictionary that'll be easy to send another API or use case in a database, for example. You just have to call the dict method on the object instance:
+
+```python
+person = Person(
+    first_name = 'John',
+    last_name = 'Doe',
+    gender = Gender.MALE,
+    birthdate = "1991-01-01",
+    interest = ["travel","sports"],
+    address = {
+        "street_address":"12 Squirell Street",
+        "postal_code":"424242",
+        "city":"Woodtown",
+        "country":"US",}
+)
+
+person_dict = person.dict()
+print(person_dict['first_name'])
+print(person_dict["address"]["street_address"])
+```
+
+Also you can add some arguments, allowing to select a subset of properties to be converted. You can either state the ones you want to be included or the ones you want to exclude:
+
+
+```python
+person_includes = person.dict(include={"first_name", "last_name"})
+print(person_includes)
+
+person_excludes = person.dict(exclude={"birthdate","interests"})
+```
+If you use a coversion quite often, it can be interesting to put in a method so that you can reuse it at will:
+
+```python
+class Person(BaseModel):
+    first_name: str
+    last_name: str
+    gender: Gender
+    birthdate: date
+    interest: List[str]
+    address: Address
+
+    def name_dict(self):
+        return self.dict(include={"first", "last_name"})
+```
+
+### Creating an instance from a sub-class object
+
+In a particular situation you'll have a model dedicated for the creation endpoint, with only the required fields for a creation, and a database model with all the fields we want to store.
+
+```python
+class PostBase(BaseModel):
+    title: str
+    content: str
+
+class PostCreate(PostBase):
+    pass
+
+class PostPublic(PostBase):
+    id: int
+
+class PostDB(PostBase):
+    id: int
+    nb_views: int = 0
+
+```
+
+In the *path* operation function for our *create* endpoint, we'll thus get a **PostCreate** instance with only title and content. However, we need to build a proper *PostDB* instance before storing it in the database. A convient way to do this is to jointly use the dict method and the unpacking syntax. 
+
+```python
+@app.post("/posts",status_code=status.HTTP_201_CREATED,response_model=PostPublic)
+async def create(post_create: PostCreate):
+    new_id = max(db.post.keys() or (0,1))+1
+    post = PostDB(id=new_id, **post_create.dict())
+    db.post[new_id] = post
+    return post
+```
+### Updating an instance with a partial one
+
+In some situations you'll want to allow partial updates. In other words you'll allow the end user to only send the fields they want to change to your API and omit the ones that shouldn't change. This is the usual way of implementing a **PATCH** endpoint. 
+
+To do this, you would first need a special Pydantic model with all fields marked as a optional so that no error es raised when a field is missing. 
+
+
+```python
+class PostBase(BaseModel):
+    title: str
+    content: str
+
+class PostPartialUpdate(BaseModel):
+    title: Optional[str] = None
+    content: Optional[str] = None
+```
+
+We are now able to implement an endpoint that will accept a subset of our Post fields. Since it's an update, we'll retrieve an existing post in the database thanks to its ID. Then, we'll have to find a way to only update the fields in the payload and keep the others untouched. Fortunately, Pydantic once again has this covered, with a handy methods and options.
+
+```python
+@app.patch("/posts/{id}",response_model=PostPublic)
+async def partial_update(id: int, post_update: PostPartialUpdate):
+    try:
+        post_db = db.posts[id]
+        updated_fields = post_update.dict(exclude_unset=True)
+        updated_post = post_db.copy(update=updated_fields)
+
+        db.posts[id] = updated_post
+        return updated_post
+    except KeyError:
+        raise HTTPException(status.HTTP_404_NOT_FOUND)        
+
+```
+
+
